@@ -83,6 +83,7 @@ bats test/rector_test.bats          # Rector job
 bats test/postjobs_test.bats        # postjobs job
 bats test/phpunit_bisect_test.bats  # PHPUnit git-bisect mode
 bats test/behat_bisect_test.bats    # Behat git-bisect mode
+bats test/phpunit_onebyone_test.bats # PHPUnit one-by-one mode
 ```
 
 `.github/workflows/ci.yml` discovers every `test/*.bats` file automatically and runs each as a separate matrix job on push and pull request, so all of the above run in CI without needing to be registered anywhere.

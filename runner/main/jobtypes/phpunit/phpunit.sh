@@ -65,6 +65,10 @@ function phpunit_to_summary() {
     echo "== RUNCOUNT: ${RUNCOUNT}"
     echo "== PHPUNIT_FILTER: ${PHPUNIT_FILTER}"
     echo "== PHPUNIT_TESTSUITE: ${PHPUNIT_TESTSUITE}"
+    if [[ -n "${PHPUNIT_ONEBYONE}" ]]; then
+        echo "== PHPUNIT_ONEBYONE: ${PHPUNIT_ONEBYONE}"
+        echo "== PHPUNIT_ONEBYONE_CHUNK: ${PHPUNIT_ONEBYONE_CHUNK} of ${PHPUNIT_ONEBYONE_CHUNKS}"
+    fi
     echo "== MOODLE_CONFIG: ${MOODLE_CONFIG}"
     echo "== PHPWORKINGDIR: ${PHPWORKINGDIR}"
     echo "== COMPOSERINSTALL: ${COMPOSERINSTALL}"
@@ -80,6 +84,9 @@ function phpunit_env() {
         RUNCOUNT
         PHPUNIT_FILTER
         PHPUNIT_TESTSUITE
+        PHPUNIT_ONEBYONE
+        PHPUNIT_ONEBYONE_CHUNKS
+        PHPUNIT_ONEBYONE_CHUNK
         EXITCODE
     )
     echo "${env[@]}"
@@ -127,7 +134,14 @@ function phpunit_config() {
     RUNCOUNT="${RUNCOUNT:-1}"
     PHPUNIT_FILTER="${PHPUNIT_FILTER:-}"
     PHPUNIT_TESTSUITE="${PHPUNIT_TESTSUITE:-}"
+    PHPUNIT_ONEBYONE="${PHPUNIT_ONEBYONE:-}"
+    PHPUNIT_ONEBYONE_CHUNKS="${PHPUNIT_ONEBYONE_CHUNKS:-1}"
+    PHPUNIT_ONEBYONE_CHUNK="${PHPUNIT_ONEBYONE_CHUNK:-1}"
     EXITCODE=0
+
+    if [[ -n "${PHPUNIT_ONEBYONE}" ]]; then
+        phpunit_config_onebyone
+    fi
 
     # If GOOD_COMMIT and BAD_COMMIT are set, it means that we are going to run a bisect
     # session, so we need to enable FULLGIT (to get access to complete repository clone).
@@ -138,12 +152,43 @@ function phpunit_config() {
     fi
 }
 
+# PHPUnit job type config for one-by-one mode.
+function phpunit_config_onebyone() {
+    if [[ -n "${GOOD_COMMIT}" ]] || [[ -n "${BAD_COMMIT}" ]]; then
+        exit_error "PHPUNIT_ONEBYONE can't be used together with GOOD_COMMIT and BAD_COMMIT (bisect)."
+    fi
+    if [[ ! "${PHPUNIT_ONEBYONE_CHUNKS}" =~ ^[1-9][0-9]*$ ]]; then
+        exit_error "PHPUNIT_ONEBYONE_CHUNKS must be a positive integer, got: ${PHPUNIT_ONEBYONE_CHUNKS}"
+    fi
+    if [[ ! "${PHPUNIT_ONEBYONE_CHUNK}" =~ ^[1-9][0-9]*$ ]] || \
+            [[ "${PHPUNIT_ONEBYONE_CHUNK}" -gt "${PHPUNIT_ONEBYONE_CHUNKS}" ]]; then
+        exit_error "PHPUNIT_ONEBYONE_CHUNK must be between 1 and ${PHPUNIT_ONEBYONE_CHUNKS}, got: ${PHPUNIT_ONEBYONE_CHUNK}"
+    fi
+    # Every test runs exactly once, repetitions make no sense here.
+    RUNCOUNT=1
+}
+
 # PHPUnit job type setup.
 function phpunit_setup() {
     # If both GOOD_COMMIT and BAD_COMMIT are not set, we are going to run a normal session.
     # (for bisect sessions we don't have to setup the environment).
     if [[ -z "${GOOD_COMMIT}" ]] && [[ -z "${BAD_COMMIT}" ]]; then
         phpunit_setup_normal
+        if [[ -n "${PHPUNIT_ONEBYONE}" ]]; then
+            # After the init, because that is what installs PHPUnit (composer install).
+            phpunit_setup_onebyone_check
+        fi
+    fi
+}
+
+# Check that the PHPUnit version supports the one-by-one mode.
+function phpunit_setup_onebyone_check() {
+    # The test list needs the "file" of every test class, which PHPUnit only gives from version 10.
+    local version
+    version=$(docker exec -u www-data "${WEBSERVER}" php vendor/bin/phpunit --version | \
+        grep -oE 'PHPUnit [0-9]+' | grep -oE '[0-9]+' || true)
+    if [[ -z "${version}" ]] || [[ "${version}" -lt 10 ]]; then
+        exit_error "PHPUNIT_ONEBYONE needs PHPUnit 10 or up, but Moodle ${MOODLE_BRANCH} uses PHPUnit ${version:-unknown}."
     fi
 }
 
@@ -171,8 +216,10 @@ function phpunit_initcmd() {
 
 # PHPUnit job type run.
 function phpunit_run() {
+    if [[ -n "${PHPUNIT_ONEBYONE}" ]]; then
+        phpunit_run_onebyone
     # If both GOOD_COMMIT and BAD_COMMIT are not set, we are going to run a normal session.
-    if [[ -z "${GOOD_COMMIT}" ]] && [[ -z "${BAD_COMMIT}" ]]; then
+    elif [[ -z "${GOOD_COMMIT}" ]] && [[ -z "${BAD_COMMIT}" ]]; then
         phpunit_run_normal
     else
         # If GOOD_COMMIT and BAD_COMMIT are set, we are going to run a bisect session.
@@ -205,6 +252,100 @@ function phpunit_run_normal() {
         EXITCODE=$((EXITCODE + $?))
         iter=$((iter+1))
     done
+
+    echo "============================================================================"
+    echo ">>> stopsection <<<"
+}
+
+# PHPUnit job type run for one-by-one mode.
+# Every test method runs on its own, in a separate PHPUnit execution, to find tests
+# that only pass because other tests ran before them.
+function phpunit_run_onebyone() {
+    echo
+    echo ">>> startsection Starting PHPUnit one-by-one run at $(date) <<<"
+    echo "============================================================================"
+
+    # List all the tests (honouring PHPUNIT_FILTER and PHPUNIT_TESTSUITE).
+    local listcmd=(
+        php
+        vendor/bin/phpunit
+        --list-tests-xml /shared/onebyone-tests.xml
+    )
+    if [[ -n "${PHPUNIT_FILTER}" ]]; then
+        listcmd+=(--filter "${PHPUNIT_FILTER}")
+    fi
+    if [[ -n "${PHPUNIT_TESTSUITE}" ]]; then
+        listcmd+=(--testsuite "${PHPUNIT_TESTSUITE}")
+    fi
+    echo "Listing tests: ${listcmd[*]}"
+    if ! docker exec -u www-data "${WEBSERVER}" "${listcmd[@]}"; then
+        print_error "Unable to list the PHPUnit tests."
+        EXITCODE=1
+        return
+    fi
+    cp "${BASEDIR}/jobtypes/phpunit/onebyone_list.php" "${SHAREDDIR}/onebyone_list.php"
+    if ! docker exec -u www-data "${WEBSERVER}" \
+            php /shared/onebyone_list.php /shared/onebyone-tests.xml > "${SHAREDDIR}/onebyone-tests.txt"; then
+        print_error "Unable to process the PHPUnit test list."
+        EXITCODE=1
+        return
+    fi
+
+    local alltests=()
+    mapfile -t alltests < "${SHAREDDIR}/onebyone-tests.txt"
+    if [[ ${#alltests[@]} -eq 0 ]]; then
+        print_error "No tests found to run."
+        EXITCODE=1
+        return
+    fi
+
+    # Pick the tests of this chunk (round robin, so every chunk gets a similar mix of components).
+    local tests=()
+    local i
+    for i in "${!alltests[@]}"; do
+        if [[ $((i % PHPUNIT_ONEBYONE_CHUNKS)) -eq $((PHPUNIT_ONEBYONE_CHUNK - 1)) ]]; then
+            tests+=("${alltests[i]}")
+        fi
+    done
+    echo "${#alltests[@]} tests found, running ${#tests[@]} of them (chunk ${PHPUNIT_ONEBYONE_CHUNK} of ${PHPUNIT_ONEBYONE_CHUNKS})."
+    echo
+
+    # Run them, one by one.
+    local logdir="${SHAREDDIR}/onebyone-failures"
+    mkdir -p "${logdir}"
+    # Same strictness as the onebyone workflow in Moodle core, plus no output allowed.
+    local flags=(
+        --fail-on-empty-test-suite
+        --fail-on-warning
+        --fail-on-risky
+        --disallow-test-output
+    )
+    local failures=()
+    local count=0
+    local line file class method filter output logfile
+    for line in "${tests[@]}"; do
+        count=$((count + 1))
+        IFS=$'\t' read -r file class method <<< "${line}"
+        # Match only this method (and all its data sets) of this class.
+        filter="/^${class//\\/\\\\}::${method}( with data set .*)?\$/"
+        if output=$(docker exec -u www-data "${WEBSERVER}" \
+                php vendor/bin/phpunit "${flags[@]}" --filter "${filter}" "${file}" 2>&1); then
+            echo "[${count}/${#tests[@]}] OK   ${class}::${method}"
+        else
+            echo "[${count}/${#tests[@]}] FAIL ${class}::${method}"
+            printf -v logfile '%s/%05d_%s.log' "${logdir}" "${count}" "${method}"
+            printf '%s\n' "${output}" > "${logfile}"
+            failures+=("php vendor/bin/phpunit ${flags[*]} --filter '${filter}' ${file}")
+        fi
+    done
+
+    echo
+    echo "Finished: ${count} tests run, ${#failures[@]} failed."
+    if [[ ${#failures[@]} -gt 0 ]]; then
+        echo "These tests fail when run on their own (output saved in ${logdir}):"
+        printf '  %s\n' "${failures[@]}"
+        EXITCODE=1
+    fi
 
     echo "============================================================================"
     echo ">>> stopsection <<<"
