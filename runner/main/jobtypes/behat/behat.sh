@@ -358,8 +358,9 @@ function behat_run_normal() {    # Run the job type.
             behat_rerun_command reruncmd "${rerun}" "${process}"
             echo "Running: ${reruncmd[*]}"
 
-            # And run it.
-            if ! docker exec -t -u www-data -e WINDOWSCALE=1.5 "${WEBSERVER}" "${reruncmd[@]}"; then
+            # And run it. Reruns use the same window size as the main run on purpose: a bigger
+            # window lets scenarios that always fail at the default size pass, hiding real bugs.
+            if ! docker exec -t -u www-data "${WEBSERVER}" "${reruncmd[@]}"; then
                 # Rerun failed, let's feed the exit code again.
                 EXITCODE=$((EXITCODE + processmask))
             fi
