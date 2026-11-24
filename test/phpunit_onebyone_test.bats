@@ -72,6 +72,11 @@ teardown() {
     PHPUNIT_TESTSUITE="mod_label_testsuite"
     PHPUNIT_FILTER="onebyone_fixture_test"
     PHPUNIT_ONEBYONE="1"
+    # Known paths, to check the files left by the run. Not within BATS_TEST_TMPDIR, because the
+    # run may leave files that bats cannot delete (the docker-logs module chowns the shared dir).
+    WORKSPACE="$(mktemp -d)/workspace"
+    BUILD_ID="onebyone"
+    local shareddir="${WORKSPACE}/${BUILD_ID}"
 
     # Checkout main and add the fixture test.
     run git_moodle_checkout main
@@ -88,6 +93,17 @@ teardown() {
     assert_output --partial "These tests fail when run on their own"
     assert_output --partial "--filter '/^mod_label\\\\onebyone_fixture_test::test_second( with data set .*)?\$/' ${FIXTURE_TARGET}"
     assert_output --partial "== Exit code: 1"
+
+    # The JUnit report, for the CI server to show the results.
+    assert [ -f "${shareddir}/onebyone.junit" ]
+    run cat "${shareddir}/onebyone.junit"
+    assert_output --partial '<testsuite name="PHPUnit one by one" tests="2" errors="0" failures="1"'
+    assert_output --regexp '<testcase name="test_first" class="mod_label\\onebyone_fixture_test" classname="mod_label.onebyone_fixture_test" file="public/mod/label/tests/onebyone_fixture_test.php" time="[0-9.]+"/>'
+    assert_output --partial '<failure type="onebyone" message="'
+    assert_output --partial "This test fails when run on its own. To reproduce it:"
+    # The helper scripts are not left within the build artefacts.
+    assert [ ! -e "${shareddir}/onebyone_list.php" ]
+    assert [ ! -e "${shareddir}/onebyone_junit.php" ]
 }
 
 @test "PHPUnit one-by-one tests: reject a chunk out of range" {

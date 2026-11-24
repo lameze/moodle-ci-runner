@@ -283,9 +283,10 @@ function phpunit_run_onebyone() {
         EXITCODE=1
         return
     fi
-    cp "${BASEDIR}/jobtypes/phpunit/onebyone_list.php" "${SHAREDDIR}/onebyone_list.php"
-    if ! docker exec -u www-data "${WEBSERVER}" \
-            php /shared/onebyone_list.php /shared/onebyone-tests.xml > "${SHAREDDIR}/onebyone-tests.txt"; then
+    # The helper scripts are passed via stdin, so they don't end up within the build artefacts.
+    if ! docker exec -i -u www-data "${WEBSERVER}" \
+            php -- /shared/onebyone-tests.xml \
+            < "${BASEDIR}/jobtypes/phpunit/onebyone_list.php" > "${SHAREDDIR}/onebyone-tests.txt"; then
         print_error "Unable to process the PHPUnit test list."
         EXITCODE=1
         return
@@ -320,24 +321,46 @@ function phpunit_run_onebyone() {
         --fail-on-risky
         --disallow-test-output
     )
+    # One line per test, used to build the JUnit report.
+    local results="${SHAREDDIR}/onebyone-results.txt"
+    : > "${results}"
     local failures=()
     local count=0
-    local line file class method filter output logfile
+    local line file class method filter output rc logfile command now start elapsed
     for line in "${tests[@]}"; do
         count=$((count + 1))
         IFS=$'\t' read -r file class method <<< "${line}"
         # Match only this method (and all its data sets) of this class.
         filter="/^${class//\\/\\\\}::${method}( with data set .*)?\$/"
-        if output=$(docker exec -u www-data "${WEBSERVER}" \
-                php vendor/bin/phpunit "${flags[@]}" --filter "${filter}" "${file}" 2>&1); then
+        # Time it in microseconds (EPOCHREALTIME needs bash 5, without it times are 0).
+        now=${EPOCHREALTIME:-0}
+        start=${now/[.,]/}
+        output=$(docker exec -u www-data "${WEBSERVER}" \
+            php vendor/bin/phpunit "${flags[@]}" --filter "${filter}" "${file}" 2>&1)
+        rc=$?
+        now=${EPOCHREALTIME:-0}
+        elapsed=$((${now/[.,]/} - start))
+        if [[ ${rc} -eq 0 ]]; then
             echo "[${count}/${#tests[@]}] OK   ${class}::${method}"
+            printf 'OK\t%s\t%s\t%s\t%s\t\t\n' "${file}" "${class}" "${method}" "${elapsed}" >> "${results}"
         else
             echo "[${count}/${#tests[@]}] FAIL ${class}::${method}"
-            printf -v logfile '%s/%05d_%s.log' "${logdir}" "${count}" "${method}"
-            printf '%s\n' "${output}" > "${logfile}"
-            failures+=("php vendor/bin/phpunit ${flags[*]} --filter '${filter}' ${file}")
+            printf -v logfile '%05d_%s.log' "${count}" "${method}"
+            printf '%s\n' "${output}" > "${logdir}/${logfile}"
+            command="php vendor/bin/phpunit ${flags[*]} --filter '${filter}' ${file}"
+            failures+=("${command}")
+            printf 'FAIL\t%s\t%s\t%s\t%s\t%s\t%s\n' "${file}" "${class}" "${method}" "${elapsed}" \
+                "onebyone-failures/${logfile}" "${command}" >> "${results}"
         fi
     done
+
+    # Write the JUnit report, so the results show in the CI server like normal PHPUnit runs.
+    if ! docker exec -i -u www-data "${WEBSERVER}" \
+            php -- /shared/onebyone-results.txt /shared/onebyone.junit \
+            < "${BASEDIR}/jobtypes/phpunit/onebyone_junit.php"; then
+        print_error "Unable to write the JUnit report of the one-by-one run."
+        EXITCODE=1
+    fi
 
     echo
     echo "Finished: ${count} tests run, ${#failures[@]} failed."
